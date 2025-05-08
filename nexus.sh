@@ -126,27 +126,80 @@ setup_nexus_zkvm() {
     echo "Setting up Nexus ZKVM environment..."
     # Set up target dan install nexus-tools dari repository Nexus
     rustup target add riscv32i-unknown-none-elf
-    cargo install --git https://github.com/nexus-xyz/nexus-zkvm nexus-tools --tag 'v0.2.4'
-    # Membuat project Nexus ZKVM
-    cargo nexus new nexus-project
-    cd nexus-project/src
+    cargo install --git https://github.com/nexus-xyz/nexus-zkvm cargo-nexus --tag 'v0.3.1'
+    # Membuat program host Nexus ZKVM
+    cargo nexus host nexus-host
+    cd nexus-host/src/guest/src
     rm -rf main.rs
-    # Menulis program contoh ke main.rs
+    # Menulis program guest contoh ke main.rs
     cat <<EOT >> main.rs
-#![no_std]
-#![no_main]
-fn fib(n: u32) -> u32 {
-    match n {
-        0 => 0,
-        1 => 1,
-        _ => fib(n - 1) + fib(n - 2),
-    }
-}
+#![cfg_attr(target_arch = "riscv32", no_std, no_main)]
+
+use nexus_rt::println;
+
 #[nexus_rt::main]
+#[nexus_rt::public_input(x)]
+fn main(x: u32, y: u32) -> u32 {
+    println!("Read public input:  {}", x);
+    println!("Read private input: {}", y);
+
+    x * y
+}
+EOT
+    cd ..
+}
+    cargo nexus host nexus-host
+    cd nexus-host/src
+    rm -rf main.rs
+    # Menulis program host contoh ke main.rs
+    cat <<EOT >> main.rs
+
+use nexus_sdk::{
+compile::{cargo::CargoPackager, Compile, Compiler},
+stwo::seq::Stwo,
+ByGuestCompilation, Local, Prover, Verifiable, Viewable,
+};
+
+const PACKAGE: &str = "guest";
+
 fn main() {
-    let n = 7;
-    let result = fib(n);
-    assert_eq!(result, 13);
+    println!("Compiling guest program...");
+    let mut prover_compiler = Compiler::<CargoPackager>::new(PACKAGE);
+    let prover: Stwo<Local> =
+        Stwo::compile(&mut prover_compiler).expect("failed to compile guest program");
+
+    let elf = prover.elf.clone(); // save elf for use with test verification
+
+    print!("Proving execution of vm... ");
+    let (view, proof) = prover
+        .prove_with_input::<u32, u32>(&3, &5)
+        .expect("failed to prove program"); // x = 5, y = 3
+
+    assert_eq!(view.exit_code().expect("failed to retrieve exit code"), nexus_sdk::KnownExitCodes::EXIT_SUCCESS as u32);
+
+    let output: u32 = view
+        .public_output::<u32>()
+        .expect("failed to retrieve public output");
+    assert_eq!(output, 15); // z = 15
+
+    println!("output is {}!", output);
+    println!(
+        ">>>>> Logging\n{}<<<<<",
+        view.logs().expect("failed to retrieve debug logs").join("")
+    );
+
+    print!("Verifying execution...");
+    proof
+        .verify_expected::<u32, u32>(
+            &5,   // x = 5
+            nexus_sdk::KnownExitCodes::EXIT_SUCCESS as u32,  
+            &15,  // z = 15
+            &elf, // expected elf (program binary)
+            &[],  // no associated data,
+        )
+        .expect("failed to verify proof");
+
+    println!("  Succeeded!");
 }
 EOT
     cd ..
